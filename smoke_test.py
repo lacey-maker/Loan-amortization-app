@@ -100,9 +100,28 @@ def test_exports():
     print(f"Exports OK — xlsx {len(xlsx):,} bytes, pdf {len(pdf):,} bytes")
 
 
+def test_io_payments_constant_mom():
+    """IO payments on a constant balance should be identical month-to-month
+    regardless of days in month (was failing under day-count accrual)."""
+    events = [
+        Event("Loan", date(2025, 9, 19), 20000.00),
+        Event("Payment", date(2025, 10, 19), 0, number=12, frequency="Monthly", special="Interest Only"),
+    ]
+    cfg = LoanConfig(nominal_annual_rate=7.75, day_count="Actual/365")
+    rows, summary = build_schedule(events, cfg)
+    io_rows = [r for r in rows if "Interest Only" in r.description]
+    assert len(io_rows) == 12
+    amounts = {r.cash_flow for r in io_rows}
+    assert len(amounts) == 1, f"IO payments varied: {sorted(amounts)}"
+    # Expected: 20000 * 7.75% / 12 = $129.17
+    assert abs(io_rows[0].cash_flow - 129.17) < 0.02, io_rows[0].cash_flow
+    print(f"IO constant MoM OK — all 12 IOs are ${io_rows[0].cash_flow:.2f}")
+
+
 if __name__ == "__main__":
     test_tvalue_example()
     test_simple_amortization()
     test_multiple_loans()
+    test_io_payments_constant_mom()
     test_exports()
     print("\nAll smoke tests passed.")

@@ -99,6 +99,7 @@ class _Tx:
     seq_in_series: int  # 1-based
     series_size: int
     series_label: str  # e.g. "Loan 1" or "Series 2"
+    frequency: Frequency = "Monthly"
 
 
 def expand_events(events: list[Event]) -> list[_Tx]:
@@ -117,6 +118,7 @@ def expand_events(events: list[Event]) -> list[_Tx]:
                 seq_in_series=1,
                 series_size=1,
                 series_label=ev.label or f"Loan {loan_count}",
+                frequency=ev.frequency,
             ))
         else:
             payment_series_count += 1
@@ -131,6 +133,7 @@ def expand_events(events: list[Event]) -> list[_Tx]:
                     seq_in_series=i + 1,
                     series_size=ev.number,
                     series_label=label,
+                    frequency=ev.frequency,
                 ))
                 d = _advance(d, ev.frequency)
     # Loan before Payment on same date
@@ -175,7 +178,18 @@ def build_schedule(
     events: list[Event],
     config: LoanConfig,
 ) -> tuple[list[ScheduleRow], dict]:
-    """Walk events chronologically and produce a schedule + summary."""
+    """Walk events chronologically and produce a schedule + summary.
+
+    Interest accrual model (TValue-aligned):
+      For each segment between consecutive transactions, interest is computed as
+        balance × period_rate × (segment_days / period_days)
+      where the "period" is bounded by the previous Payment date (or the first
+      event) and the next Payment date, and period_rate = annual_rate / periods_per_year
+      using the next Payment's frequency. This makes IO payments CONSTANT
+      month-to-month (since segment_days == period_days when no mid-period
+      balance change occurs), while still attributing stub-period interest
+      correctly when a Loan event lands mid-period.
+    """
     txs = expand_events(events)
     if not txs:
         return [], {
@@ -186,13 +200,31 @@ def build_schedule(
 
     annual_rate = config.nominal_annual_rate / 100.0
 
-    # Pre-compute level payment for each P&I series (if any)
-    pi_payments: dict[tuple[date, str], float] = {}
-    # Group P&I series and compute the level payment at the time of first pmt
-    # We'll do a first pass to figure out balance at first-pmt time.
-    # Since balance depends on prior events, easiest to compute inline via a dry-run
-    # ignoring the P&I rows we haven't computed yet — but to keep it simple, compute
-    # P&I level payment using balance just before that series starts.
+    # Pre-compute the "next payment" for each tx so we can determine
+    # period_rate and period_days during the segment leading up to it.
+    next_payment_idx: list[int] = [-1] * len(txs)
+    nxt = -1
+    for i in range(len(txs) - 1, -1, -1):
+        if txs[i].kind == "Payment":
+            nxt = i
+        next_payment_idx[i] = nxt
+
+    # Period start = previous Payment date (or first tx date if none yet)
+    def period_bounds_for(payment_idx: int) -> tuple[date, date, int]:
+        """Returns (period_start, period_end, period_days) for a payment tx."""
+        if payment_idx < 0:
+            return txs[0].date, txs[0].date, 1
+        end = txs[payment_idx].date
+        # find prior payment
+        start = None
+        for j in range(payment_idx - 1, -1, -1):
+            if txs[j].kind == "Payment":
+                start = txs[j].date
+                break
+        if start is None:
+            start = txs[0].date  # use first event (loan) as series anchor
+        days = max(1, (end - start).days)
+        return start, end, days
 
     rows: list[ScheduleRow] = []
     balance = 0.0
@@ -200,12 +232,8 @@ def build_schedule(
     last_date = txs[0].date
     seq = 0
 
-    # Group P&I txs by series so we can pre-solve once we encounter the first one
-    pi_solved: dict[int, float] = {}  # key = id(series start tx)
-
-    # Build index from each P&I tx to its series-start tx
+    # Index from each P&I tx to its series-start tx
     series_start_idx: dict[int, int] = {}
-    last_label = None
     last_start = -1
     for i, t in enumerate(txs):
         if t.kind == "Payment" and t.special == "P&I":
@@ -214,13 +242,24 @@ def build_schedule(
             series_start_idx[i] = last_start
         else:
             last_start = -1
+    pi_solved: dict[int, float] = {}
 
     for i, tx in enumerate(txs):
         seq += 1
-        # accrue interest from last_date to tx.date
+        # Accrue interest for the segment from last_date to tx.date,
+        # using the period rate of the next-upcoming payment.
         if tx.date > last_date:
-            yf = _day_count_fraction(last_date, tx.date, config.day_count)
-            accrued_interest += balance * annual_rate * yf
+            np_idx = next_payment_idx[i] if tx.kind != "Payment" else i
+            if np_idx >= 0:
+                np = txs[np_idx]
+                _, _, period_days = period_bounds_for(np_idx)
+                period_rate = annual_rate / PERIODS_PER_YEAR[np.frequency]
+                segment_days = (tx.date - last_date).days
+                accrued_interest += balance * period_rate * (segment_days / period_days)
+            # else: no upcoming payment — fall back to day-count year fraction
+            else:
+                yf = _day_count_fraction(last_date, tx.date, config.day_count)
+                accrued_interest += balance * annual_rate * yf
 
         row_interest = 0.0
         row_principal = 0.0
@@ -232,14 +271,12 @@ def build_schedule(
             cash_flow = tx.amount
             description = f"{tx.series_label} disbursement"
         else:
-            # Determine payment amount
             if tx.special == "Interest Only":
                 payment = accrued_interest
                 description = f"{tx.series_label} — Interest Only ({tx.seq_in_series}/{tx.series_size})"
             elif tx.special == "P&I":
                 start_i = series_start_idx[i]
                 if start_i not in pi_solved:
-                    # solve using current balance + accrued, across the series
                     series_dates = [
                         txs[j].date for j in range(start_i, len(txs))
                         if txs[j].kind == "Payment" and txs[j].special == "P&I"
@@ -259,7 +296,6 @@ def build_schedule(
                                if tx.series_size > 1 else
                                f"{tx.series_label} — Payment")
 
-            # Allocate: interest first, then principal
             interest_portion = min(payment, accrued_interest)
             principal_portion = payment - interest_portion
             if principal_portion > balance:
