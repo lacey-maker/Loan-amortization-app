@@ -1,22 +1,20 @@
-"""Streamlit loan amortization app — a TValue Online replacement.
+"""Streamlit loan amortization app — event-based, TValue-style.
 
 Run:
     streamlit run app.py
 """
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date
 
 import pandas as pd
 import streamlit as st
 
 from amortization import (
-    COMPOUNDING_PER_YEAR,
     PERIODS_PER_YEAR,
-    ExtraPayment,
-    LoanInputs,
+    Event,
+    LoanConfig,
     build_schedule,
-    standard_payment,
 )
 from exports import to_excel, to_pdf
 
@@ -28,156 +26,154 @@ st.set_page_config(
 )
 
 st.title("💰 Loan Amortization")
-st.caption("Build schedules, model extra payments, export to PDF & Excel.")
-
-# ----- Sidebar: loan inputs -----
-with st.sidebar:
-    st.header("Loan Details")
-    borrower = st.text_input("Borrower / Label", value="")
-    principal = st.number_input("Loan Amount ($)", min_value=0.0, value=250_000.00, step=1_000.00, format="%.2f")
-    annual_rate = st.number_input("Annual Rate (%)", min_value=0.0, max_value=100.0, value=6.500, step=0.125, format="%.4f")
-    term_years = st.number_input("Term (years)", min_value=0.0, max_value=60.0, value=30.0, step=0.5)
-    payment_frequency = st.selectbox("Payment Frequency", list(PERIODS_PER_YEAR.keys()), index=2)
-    compounding = st.selectbox("Compounding", list(COMPOUNDING_PER_YEAR.keys()) + ["Continuous"], index=1)
-    start_date = st.date_input("Loan Start Date", value=date.today())
-    first_pmt = st.date_input(
-        "First Payment Date",
-        value=start_date + timedelta(days=30),
-    )
-    loan_type = st.radio("Loan Type", ["Standard", "Interest-Only"], horizontal=True)
-    io_period_years = 0.0
-    io_then = "Amortize"
-    if loan_type == "Interest-Only":
-        io_period_years = st.number_input(
-            "Interest-Only Period (years)",
-            min_value=0.0, max_value=float(term_years),
-            value=min(5.0, float(term_years)), step=0.5,
-            help="During this period, payments cover interest only. Set equal to term for fully IO.",
-        )
-        io_then = st.selectbox(
-            "After IO period",
-            ["Amortize", "Balloon"],
-            help="Amortize: converts to P&I for remaining term. Balloon: remaining balance due at end of IO period.",
-        )
-
-    use_custom_pmt = st.checkbox("Override scheduled payment")
-    payment_override = None
-    if use_custom_pmt:
-        payment_override = st.number_input("Custom Payment ($)", min_value=0.0, value=0.0, step=10.0, format="%.2f")
-    balloon_enabled = st.checkbox("Balloon payment (explicit date)")
-    balloon_date = None
-    if balloon_enabled:
-        balloon_date = st.date_input("Balloon Date", value=date.today() + timedelta(days=365 * 5))
-
-# ----- Main area -----
-st.subheader("Extra Payments")
-st.caption("Add one-time or recurring extra principal payments. They're applied on the payment date.")
-
-if "extras" not in st.session_state:
-    st.session_state.extras: list[dict] = []
-
-cols = st.columns([1.2, 1.2, 1.2, 1.4, 1.4, 0.8])
-cols[0].markdown("**Start Date**")
-cols[1].markdown("**Amount ($)**")
-cols[2].markdown("**Recurring?**")
-cols[3].markdown("**Frequency**")
-cols[4].markdown("**End Date (optional)**")
-cols[5].markdown("**Remove**")
-
-for i, ex in enumerate(list(st.session_state.extras)):
-    c = st.columns([1.2, 1.2, 1.2, 1.4, 1.4, 0.8])
-    ex["start_date"] = c[0].date_input("", value=ex["start_date"], key=f"ex_sd_{i}", label_visibility="collapsed")
-    ex["amount"] = c[1].number_input("", min_value=0.0, value=float(ex["amount"]), step=50.0, format="%.2f",
-                                      key=f"ex_amt_{i}", label_visibility="collapsed")
-    ex["recurring"] = c[2].checkbox("", value=ex["recurring"], key=f"ex_rec_{i}", label_visibility="collapsed")
-    ex["frequency"] = c[3].selectbox("", list(PERIODS_PER_YEAR.keys()),
-                                      index=list(PERIODS_PER_YEAR.keys()).index(ex["frequency"]),
-                                      key=f"ex_freq_{i}", label_visibility="collapsed",
-                                      disabled=not ex["recurring"])
-    end_val = c[4].date_input("", value=ex.get("end_date") or date.today() + timedelta(days=365*5),
-                               key=f"ex_end_{i}", label_visibility="collapsed",
-                               disabled=not ex["recurring"])
-    ex["end_date"] = end_val if ex["recurring"] else None
-    if c[5].button("🗑", key=f"ex_del_{i}"):
-        st.session_state.extras.pop(i)
-        st.rerun()
-
-add_cols = st.columns([1, 1, 6])
-if add_cols[0].button("+ Add extra payment"):
-    st.session_state.extras.append({
-        "start_date": date.today(),
-        "amount": 100.00,
-        "recurring": False,
-        "frequency": "Monthly",
-        "end_date": None,
-    })
-    st.rerun()
-
-if add_cols[1].button("Clear all", disabled=not st.session_state.extras):
-    st.session_state.extras = []
-    st.rerun()
-
-# ----- Build schedule -----
-extras = [
-    ExtraPayment(
-        start_date=e["start_date"],
-        amount=float(e["amount"]),
-        recurring=bool(e["recurring"]),
-        frequency=e["frequency"],
-        end_date=e["end_date"],
-    )
-    for e in st.session_state.extras
-    if e["amount"] > 0
-]
-
-inputs = LoanInputs(
-    principal=principal,
-    annual_rate=annual_rate,
-    term_years=term_years,
-    start_date=start_date,
-    first_payment_date=first_pmt,
-    payment_frequency=payment_frequency,
-    compounding=compounding,
-    balloon_date=balloon_date,
-    payment_override=payment_override if payment_override and payment_override > 0 else None,
-    extras=extras,
-    loan_type=loan_type,
-    io_period_years=io_period_years,
-    io_then=io_then,
+st.caption(
+    "Event-based loan modeling: add Loan disbursements and Payment series. "
+    "Mix interest-only periods, multiple draws, and balloon payments — like TValue."
 )
 
+# ---------- Top: loan-level config ----------
+top = st.columns([2, 1, 1, 1])
+label = top[0].text_input("Label / Borrower", value="")
+rate = top[1].number_input(
+    "Nominal Annual Rate (%)",
+    min_value=0.0, max_value=100.0,
+    value=7.7500, step=0.125, format="%.4f",
+)
+day_count = top[2].selectbox("Day Count", ["Actual/365", "Actual/360", "30/360"], index=0)
+compounding = top[3].selectbox(
+    "Compounding (display)",
+    ["Monthly", "Daily", "Annually", "Quarterly", "Semi-Annually"],
+    index=0,
+)
+
+# ---------- Events table ----------
+st.subheader("Events")
+st.caption(
+    "Add rows for each loan disbursement and each payment series. "
+    "**Type**: Loan or Payment. "
+    "**Special**: leave blank for fixed amount, choose 'Interest Only' to compute interest each period, "
+    "or 'P&I' to solve for level payment over the series."
+)
+
+FREQ_OPTIONS = list(PERIODS_PER_YEAR.keys())
+SPECIAL_OPTIONS = ["", "Interest Only", "P&I"]
+
+DEFAULT_EVENTS = pd.DataFrame([
+    {"Type": "Loan",    "Date": date(2025, 9, 19),  "Amount": 20000.00,  "Number": 1,  "Frequency": "Monthly", "Special": "",              "Label": ""},
+    {"Type": "Payment", "Date": date(2025, 10, 19), "Amount": 0.00,      "Number": 5,  "Frequency": "Monthly", "Special": "Interest Only", "Label": ""},
+    {"Type": "Loan",    "Date": date(2026, 2, 23),  "Amount": 159000.00, "Number": 1,  "Frequency": "Monthly", "Special": "",              "Label": ""},
+    {"Type": "Payment", "Date": date(2026, 3, 19),  "Amount": 0.00,      "Number": 24, "Frequency": "Monthly", "Special": "Interest Only", "Label": ""},
+    {"Type": "Payment", "Date": date(2028, 3, 19),  "Amount": 180173.14, "Number": 1,  "Frequency": "Monthly", "Special": "",              "Label": "Balloon"},
+])
+
+if "events_df" not in st.session_state:
+    st.session_state.events_df = DEFAULT_EVENTS.copy()
+
+reset_col, _ = st.columns([1, 6])
+if reset_col.button("Reset to example"):
+    st.session_state.events_df = DEFAULT_EVENTS.copy()
+    st.rerun()
+
+edited_df = st.data_editor(
+    st.session_state.events_df,
+    column_config={
+        "Type": st.column_config.SelectboxColumn(
+            "Type", options=["Loan", "Payment"], required=True, width="small",
+        ),
+        "Date": st.column_config.DateColumn("Date", required=True, format="MM/DD/YYYY"),
+        "Amount": st.column_config.NumberColumn(
+            "Amount ($)", format="$%.2f", min_value=0.0, step=100.0,
+        ),
+        "Number": st.column_config.NumberColumn(
+            "Number", min_value=1, max_value=1200, step=1, default=1,
+            help="Number of payments in the series (Payment events only).",
+        ),
+        "Frequency": st.column_config.SelectboxColumn(
+            "Frequency", options=FREQ_OPTIONS, required=True, width="small",
+        ),
+        "Special": st.column_config.SelectboxColumn(
+            "Special", options=SPECIAL_OPTIONS, width="medium",
+            help="Interest Only = pay accrued interest only. P&I = solve for level payment.",
+        ),
+        "Label": st.column_config.TextColumn("Label (optional)", width="small"),
+    },
+    num_rows="dynamic",
+    use_container_width=True,
+    hide_index=True,
+    key="events_editor",
+)
+st.session_state.events_df = edited_df
+
+# ---------- Build events list ----------
+events: list[Event] = []
+for _, row in edited_df.iterrows():
+    if pd.isna(row["Date"]) or pd.isna(row["Type"]):
+        continue
+    try:
+        d = row["Date"]
+        if hasattr(d, "to_pydatetime"):
+            d = d.to_pydatetime().date()
+        elif hasattr(d, "date") and callable(d.date):
+            d = d.date()
+        events.append(Event(
+            event_type=row["Type"],
+            date=d,
+            amount=float(row["Amount"] or 0),
+            number=int(row["Number"] or 1),
+            frequency=row["Frequency"] or "Monthly",
+            special=row["Special"] or "",
+            label=str(row["Label"] or ""),
+        ))
+    except Exception as exc:
+        st.warning(f"Skipping row: {exc}")
+
+config = LoanConfig(
+    nominal_annual_rate=rate,
+    day_count=day_count,
+    compounding=compounding,
+    label=label,
+)
+
+if not events:
+    st.info("Add at least one Loan event and one Payment event to build a schedule.")
+    st.stop()
+
 try:
-    rows, summary = build_schedule(inputs)
+    rows, summary = build_schedule(events, config)
 except Exception as exc:
     st.error(f"Could not build schedule: {exc}")
     st.stop()
 
-# ----- Summary tiles -----
+# ---------- Summary tiles ----------
 st.subheader("Summary")
 m = st.columns(5)
-m[0].metric("Scheduled Payment", f"${summary['scheduled_payment']:,.2f}")
-m[1].metric("Total Interest", f"${summary['total_interest']:,.2f}")
-m[2].metric("Total Paid", f"${summary['total_paid']:,.2f}")
-m[3].metric("Payoff Date", str(summary.get("payoff_date") or "—"))
-m[4].metric("Interest Saved", f"${summary['interest_saved']:,.2f}",
-            delta=f"−{summary['periods_saved']} periods" if summary["periods_saved"] else None)
+m[0].metric("Total Disbursed", f"${summary['total_disbursed']:,.2f}")
+m[1].metric("Total Paid", f"${summary['total_paid']:,.2f}")
+m[2].metric("Total Interest", f"${summary['total_interest_paid']:,.2f}")
+m[3].metric(
+    "Ending Balance",
+    f"${summary['ending_balance']:,.2f}",
+    delta=(f"+${summary['ending_accrued_interest']:,.2f} accrued"
+           if summary["ending_accrued_interest"] > 0.005 else None),
+)
+m[4].metric("Net Cost (Paid − Disbursed)", f"${summary['net_cost']:,.2f}")
 
-# ----- Schedule table -----
-st.subheader("Amortization Schedule")
+# ---------- Schedule table ----------
+st.subheader("Schedule")
 df = pd.DataFrame([r.__dict__ for r in rows])
 if not df.empty:
     df_display = df.rename(columns={
-        "period": "#",
-        "payment_date": "Date",
-        "beginning_balance": "Begin Balance",
-        "scheduled_payment": "Scheduled",
-        "extra_payment": "Extra",
+        "seq": "#",
+        "date": "Date",
+        "kind": "Type",
+        "description": "Description",
+        "cash_flow": "Cash Flow",
         "interest": "Interest",
         "principal": "Principal",
-        "total_payment": "Total Pmt",
-        "ending_balance": "End Balance",
+        "balance": "Balance",
+        "accrued_interest": "Accrued Int.",
     })
-    money_cols = ["Begin Balance", "Scheduled", "Extra", "Interest", "Principal", "Total Pmt", "End Balance"]
+    money_cols = ["Cash Flow", "Interest", "Principal", "Balance", "Accrued Int."]
     st.dataframe(
         df_display.style.format({c: "${:,.2f}" for c in money_cols}),
         use_container_width=True,
@@ -185,31 +181,24 @@ if not df.empty:
         hide_index=True,
     )
 
-# ----- Balance chart -----
-if not df.empty:
-    st.subheader("Balance Over Time")
-    chart_df = df[["payment_date", "ending_balance"]].copy()
+    # Balance chart
+    chart_df = df[["date", "balance"]].copy()
     chart_df.columns = ["Date", "Balance"]
     chart_df = chart_df.set_index("Date")
+    st.subheader("Balance Over Time")
     st.line_chart(chart_df, height=240)
 
-# ----- Exports -----
+# ---------- Exports ----------
 st.subheader("Export")
-loan_type_label = loan_type
-if loan_type == "Interest-Only":
-    loan_type_label = f"Interest-Only ({io_period_years:g} yrs, then {io_then})"
-
 loan_meta = {
-    "title": f"Amortization — {borrower}" if borrower else "Loan Amortization Schedule",
-    "borrower": borrower,
-    "principal": principal,
-    "annual_rate": annual_rate,
-    "term_years": term_years,
-    "payment_frequency": payment_frequency,
+    "title": f"Amortization — {label}" if label else "Loan Amortization Schedule",
+    "borrower": label,
+    "nominal_annual_rate": rate,
+    "day_count": day_count,
     "compounding": compounding,
-    "start_date": start_date,
-    "first_payment_date": first_pmt,
-    "loan_type": loan_type_label,
+    "first_date": summary.get("first_date"),
+    "last_date": summary.get("last_date"),
+    "row_count": summary.get("row_count", 0),
 }
 
 ex_col1, ex_col2, _ = st.columns([1, 1, 4])
@@ -218,7 +207,7 @@ try:
     ex_col1.download_button(
         "📊 Download Excel",
         data=xlsx_bytes,
-        file_name=f"amortization_{borrower or 'loan'}.xlsx",
+        file_name=f"amortization_{label or 'loan'}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
     )
@@ -230,7 +219,7 @@ try:
     ex_col2.download_button(
         "📄 Download PDF",
         data=pdf_bytes,
-        file_name=f"amortization_{borrower or 'loan'}.pdf",
+        file_name=f"amortization_{label or 'loan'}.pdf",
         mime="application/pdf",
         use_container_width=True,
     )
@@ -239,16 +228,21 @@ except Exception as exc:
 
 with st.expander("About this tool"):
     st.markdown("""
-    **Loan Amortization** — a self-hosted alternative to TValue Online.
+    **Loan Amortization** — event-based modeling, like TValue.
 
-    **Current features**
-    - Multiple payment frequencies (weekly through annual)
-    - Compounding independent of payment frequency
-    - Extra payments: one-time or recurring, with optional end date
-    - Balloon payments
-    - Excel & PDF exports with full schedule and summary
+    **How to use it**
+    1. Set the **rate** and **day count** at the top.
+    2. Build your loan in the **Events** table:
+        - Each **Loan** row is a disbursement (date + amount).
+        - Each **Payment** row is a series: date is the first payment, **Number** is how many,
+          **Frequency** controls spacing.
+    3. **Special** column on payments:
+        - *blank* — fixed amount you type into the Amount column
+        - *Interest Only* — auto-computes accrued interest each period
+        - *P&I* — solves for level principal+interest payment across the series
 
     **Tips**
-    - Override the scheduled payment to model interest-only or custom terms.
-    - Set an end date on recurring extras to model "pay double for 2 years, then drop off."
+    - Multiple loans? Add multiple Loan rows on different dates — they layer onto the balance.
+    - Balloon? Add a final Payment row with the balloon amount, Number=1.
+    - Skip a payment? Don't add a row for that period.
     """)

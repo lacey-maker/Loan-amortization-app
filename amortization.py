@@ -1,318 +1,301 @@
-"""Loan amortization engine with extra-payment support."""
+"""Event-based loan amortization engine.
+
+Modeled after TValue: a loan is a chronological series of EVENTS — Loan
+disbursements and Payment series. Interest accrues continuously between
+events using a day-count convention and is paid down on Payment events.
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Literal
 
 from dateutil.relativedelta import relativedelta
 
+EventType = Literal["Loan", "Payment"]
+SpecialSeries = Literal["", "Interest Only", "P&I"]
 Frequency = Literal["Monthly", "Bi-Weekly", "Weekly", "Quarterly", "Semi-Annually", "Annually"]
+DayCount = Literal["Actual/365", "Actual/360", "30/360"]
 
 PERIODS_PER_YEAR = {
-    "Weekly": 52,
-    "Bi-Weekly": 26,
-    "Monthly": 12,
-    "Quarterly": 4,
-    "Semi-Annually": 2,
-    "Annually": 1,
+    "Weekly": 52, "Bi-Weekly": 26, "Monthly": 12,
+    "Quarterly": 4, "Semi-Annually": 2, "Annually": 1,
 }
-
-Compounding = Literal["Monthly", "Daily", "Annually", "Semi-Annually", "Quarterly", "Continuous"]
-
-COMPOUNDING_PER_YEAR = {
-    "Daily": 365,
-    "Monthly": 12,
-    "Quarterly": 4,
-    "Semi-Annually": 2,
-    "Annually": 1,
-}
-
-
-@dataclass
-class ExtraPayment:
-    """Additional principal payment applied on top of scheduled P&I."""
-    start_date: date
-    amount: float
-    recurring: bool = False
-    frequency: Frequency = "Monthly"
-    end_date: date | None = None
-
-    def applies_on(self, period_date: date) -> bool:
-        if period_date < self.start_date:
-            return False
-        if self.end_date and period_date > self.end_date:
-            return False
-        if not self.recurring:
-            return period_date == self.start_date
-        return True
-
-
-LoanType = Literal["Standard", "Interest-Only"]
-
-
-@dataclass
-class LoanInputs:
-    principal: float
-    annual_rate: float  # as percent, e.g. 6.5
-    term_years: float
-    start_date: date
-    first_payment_date: date | None = None
-    payment_frequency: Frequency = "Monthly"
-    compounding: Compounding = "Monthly"
-    balloon_date: date | None = None
-    payment_override: float | None = None  # if user wants fixed payment
-    extras: list[ExtraPayment] = field(default_factory=list)
-    loan_type: LoanType = "Standard"
-    io_period_years: float = 0.0  # interest-only period length (if loan_type == "Interest-Only")
-    io_then: Literal["Amortize", "Balloon"] = "Amortize"  # what happens after IO period
-
-    def periods_per_year(self) -> int:
-        return PERIODS_PER_YEAR[self.payment_frequency]
-
-    def total_periods(self) -> int:
-        return int(round(self.term_years * self.periods_per_year()))
-
-    def period_rate(self) -> float:
-        """Periodic rate, respecting compounding convention.
-
-        Converts nominal annual rate with the stated compounding to an
-        equivalent rate per payment period.
-        """
-        annual = self.annual_rate / 100.0
-        if annual == 0:
-            return 0.0
-        if self.compounding == "Continuous":
-            # e^(r/n) - 1
-            import math
-            return math.exp(annual / self.periods_per_year()) - 1
-        m = COMPOUNDING_PER_YEAR[self.compounding]
-        n = self.periods_per_year()
-        # effective annual rate, then convert to period rate
-        eff = (1 + annual / m) ** m - 1
-        return (1 + eff) ** (1 / n) - 1
-
-    def period_delta(self) -> relativedelta | "timedelta":
-        from datetime import timedelta
-        freq = self.payment_frequency
-        if freq == "Monthly":
-            return relativedelta(months=1)
-        if freq == "Quarterly":
-            return relativedelta(months=3)
-        if freq == "Semi-Annually":
-            return relativedelta(months=6)
-        if freq == "Annually":
-            return relativedelta(years=1)
-        if freq == "Bi-Weekly":
-            return timedelta(weeks=2)
-        if freq == "Weekly":
-            return timedelta(weeks=1)
-        raise ValueError(freq)
-
-
-@dataclass
-class ScheduleRow:
-    period: int
-    payment_date: date
-    beginning_balance: float
-    scheduled_payment: float
-    extra_payment: float
-    interest: float
-    principal: float
-    total_payment: float
-    ending_balance: float
 
 
 def _round(value: float) -> float:
     return float(Decimal(value).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
 
-def standard_payment(principal: float, period_rate: float, periods: int) -> float:
-    """Level P&I payment for a fully-amortizing loan."""
-    if periods <= 0:
+def _advance(d: date, freq: Frequency) -> date:
+    if freq == "Monthly":
+        return d + relativedelta(months=1)
+    if freq == "Quarterly":
+        return d + relativedelta(months=3)
+    if freq == "Semi-Annually":
+        return d + relativedelta(months=6)
+    if freq == "Annually":
+        return d + relativedelta(years=1)
+    if freq == "Bi-Weekly":
+        return d + timedelta(weeks=2)
+    if freq == "Weekly":
+        return d + timedelta(weeks=1)
+    raise ValueError(freq)
+
+
+def _day_count_fraction(d1: date, d2: date, convention: DayCount) -> float:
+    """Year fraction between two dates per convention."""
+    if convention == "30/360":
+        d1d, d2d = min(d1.day, 30), min(d2.day, 30)
+        days = 360 * (d2.year - d1.year) + 30 * (d2.month - d1.month) + (d2d - d1d)
+        return days / 360.0
+    days = (d2 - d1).days
+    if convention == "Actual/360":
+        return days / 360.0
+    return days / 365.0  # Actual/365 default
+
+
+@dataclass
+class Event:
+    """A single loan or payment event row from the editor."""
+    event_type: EventType
+    date: date
+    amount: float = 0.0  # disbursement amount or per-payment amount
+    number: int = 1  # how many payments in this series (Payment only)
+    frequency: Frequency = "Monthly"
+    special: SpecialSeries = ""
+    label: str = ""
+
+
+@dataclass
+class LoanConfig:
+    nominal_annual_rate: float  # percent, e.g. 7.75
+    day_count: DayCount = "Actual/365"
+    compounding: str = "Monthly"  # informational
+    label: str = ""
+
+
+@dataclass
+class ScheduleRow:
+    seq: int
+    date: date
+    kind: str  # "Loan" or "Payment"
+    description: str
+    cash_flow: float  # absolute dollars (positive)
+    interest: float
+    principal: float
+    balance: float  # principal balance after this row
+    accrued_interest: float  # unpaid interest carried after this row
+
+
+@dataclass
+class _Tx:
+    """Internal expanded transaction (one row in the schedule)."""
+    date: date
+    kind: str  # "Loan" or "Payment"
+    amount: float
+    special: SpecialSeries
+    seq_in_series: int  # 1-based
+    series_size: int
+    series_label: str  # e.g. "Loan 1" or "Series 2"
+
+
+def expand_events(events: list[Event]) -> list[_Tx]:
+    """Expand each event into one transaction per actual cash flow."""
+    txs: list[_Tx] = []
+    loan_count = 0
+    payment_series_count = 0
+    for ev in events:
+        if ev.event_type == "Loan":
+            loan_count += 1
+            txs.append(_Tx(
+                date=ev.date,
+                kind="Loan",
+                amount=ev.amount,
+                special="",
+                seq_in_series=1,
+                series_size=1,
+                series_label=ev.label or f"Loan {loan_count}",
+            ))
+        else:
+            payment_series_count += 1
+            d = ev.date
+            label = ev.label or f"Series {payment_series_count}"
+            for i in range(max(1, ev.number)):
+                txs.append(_Tx(
+                    date=d,
+                    kind="Payment",
+                    amount=ev.amount,
+                    special=ev.special,
+                    seq_in_series=i + 1,
+                    series_size=ev.number,
+                    series_label=label,
+                ))
+                d = _advance(d, ev.frequency)
+    # Loan before Payment on same date
+    txs.sort(key=lambda t: (t.date, 0 if t.kind == "Loan" else 1))
+    return txs
+
+
+def _solve_level_payment(balance: float, daily_rate: float, dates: list[date],
+                          day_count: DayCount) -> float:
+    """Solve for level periodic payment that pays balance to zero across given dates.
+
+    Uses present-value Newton's method on the actual day-count between dates.
+    """
+    if not dates or balance <= 0:
         return 0.0
-    if period_rate == 0:
-        return principal / periods
-    r = period_rate
-    n = periods
-    return principal * (r * (1 + r) ** n) / ((1 + r) ** n - 1)
+
+    def pv_residual(pmt: float) -> float:
+        bal = balance
+        prior = dates[0]
+        # interest accrues from "now" (time of first payment minus 1 period?) — for simplicity
+        # treat balance as outstanding at first payment date, no accrual for first period
+        for i, d in enumerate(dates):
+            if i > 0:
+                yf = _day_count_fraction(prior, d, day_count)
+                bal += bal * daily_rate * 365 * yf  # daily_rate*365 = annual; *yf = period
+            bal -= pmt
+            prior = d
+        return bal  # want zero
+
+    # bisection — robust enough
+    lo, hi = 0.0, balance * 10
+    for _ in range(80):
+        mid = (lo + hi) / 2
+        if pv_residual(mid) > 0:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) / 2
 
 
-def build_schedule(inputs: LoanInputs) -> tuple[list[ScheduleRow], dict]:
-    """Generate an amortization schedule and summary totals."""
-    r = inputs.period_rate()
-    n = inputs.total_periods()
-    ppy = inputs.periods_per_year()
+def build_schedule(
+    events: list[Event],
+    config: LoanConfig,
+) -> tuple[list[ScheduleRow], dict]:
+    """Walk events chronologically and produce a schedule + summary."""
+    txs = expand_events(events)
+    if not txs:
+        return [], {
+            "total_disbursed": 0, "total_interest_paid": 0, "total_principal_paid": 0,
+            "total_paid": 0, "ending_balance": 0, "ending_accrued_interest": 0,
+            "row_count": 0, "first_date": None, "last_date": None, "net_cost": 0,
+        }
 
-    io_periods = 0
-    if inputs.loan_type == "Interest-Only":
-        io_periods = int(round(inputs.io_period_years * ppy))
-        io_periods = min(io_periods, n)
+    annual_rate = config.nominal_annual_rate / 100.0
 
-    # scheduled P&I payment (used once IO period ends, or for the whole loan if Standard)
-    if inputs.payment_override:
-        scheduled = inputs.payment_override
-    elif inputs.loan_type == "Interest-Only" and inputs.io_then == "Balloon" and io_periods >= n:
-        scheduled = 0.0  # IO only, balloon at end
-    else:
-        amort_periods = max(1, n - io_periods)
-        scheduled = standard_payment(inputs.principal, r, amort_periods)
-
-    first_pmt = inputs.first_payment_date or (inputs.start_date + inputs.period_delta())
-    delta = inputs.period_delta()
+    # Pre-compute level payment for each P&I series (if any)
+    pi_payments: dict[tuple[date, str], float] = {}
+    # Group P&I series and compute the level payment at the time of first pmt
+    # We'll do a first pass to figure out balance at first-pmt time.
+    # Since balance depends on prior events, easiest to compute inline via a dry-run
+    # ignoring the P&I rows we haven't computed yet — but to keep it simple, compute
+    # P&I level payment using balance just before that series starts.
 
     rows: list[ScheduleRow] = []
-    balance = inputs.principal
-    pmt_date = first_pmt
-    period = 0
-    max_iter = n * 3 + 500  # safety
-    amort_pmt_recalculated = False
+    balance = 0.0
+    accrued_interest = 0.0
+    last_date = txs[0].date
+    seq = 0
 
-    while balance > 0.005 and period < max_iter:
-        period += 1
-        beginning = balance
-        interest = beginning * r
-        is_io_period = inputs.loan_type == "Interest-Only" and period <= io_periods
+    # Group P&I txs by series so we can pre-solve once we encounter the first one
+    pi_solved: dict[int, float] = {}  # key = id(series start tx)
 
-        # extra payments that apply on this date
-        extra = 0.0
-        for ex in inputs.extras:
-            if ex.applies_on(pmt_date):
-                extra += ex.amount
-
-        # Recalculate amortizing payment when transitioning out of IO period
-        # (in case extras during IO changed the balance).
-        if (
-            inputs.loan_type == "Interest-Only"
-            and not is_io_period
-            and not amort_pmt_recalculated
-            and not inputs.payment_override
-            and inputs.io_then == "Amortize"
-        ):
-            remaining = max(1, n - io_periods)
-            scheduled = standard_payment(beginning, r, remaining)
-            amort_pmt_recalculated = True
-
-        # End-of-IO balloon: pay off remaining balance
-        end_of_io_balloon = (
-            inputs.loan_type == "Interest-Only"
-            and inputs.io_then == "Balloon"
-            and period == max(io_periods, 1)
-        )
-
-        # Explicit balloon date: pay off in full
-        if inputs.balloon_date and pmt_date >= inputs.balloon_date:
-            principal_portion = beginning
-            total_payment = interest + principal_portion + extra
-            rows.append(ScheduleRow(
-                period=period, payment_date=pmt_date,
-                beginning_balance=_round(beginning),
-                scheduled_payment=_round(interest + principal_portion),
-                extra_payment=_round(extra),
-                interest=_round(interest),
-                principal=_round(principal_portion),
-                total_payment=_round(total_payment),
-                ending_balance=0.0,
-            ))
-            break
-
-        if is_io_period and not end_of_io_balloon:
-            # Interest-only: scheduled pays interest; extras reduce principal
-            sched_this = interest
-            extra_this = extra
-            principal_portion = min(extra, beginning)
-            if principal_portion >= beginning:
-                principal_portion = beginning
-                balance = 0.0
-            else:
-                balance = beginning - principal_portion
-            total_payment = sched_this + extra_this
-            rows.append(ScheduleRow(
-                period=period, payment_date=pmt_date,
-                beginning_balance=_round(beginning),
-                scheduled_payment=_round(sched_this),
-                extra_payment=_round(extra_this),
-                interest=_round(interest),
-                principal=_round(principal_portion),
-                total_payment=_round(total_payment),
-                ending_balance=_round(balance),
-            ))
-            pmt_date = pmt_date + delta
-            continue
-
-        if end_of_io_balloon:
-            # Final period of IO-only loan: balloon remaining balance
-            principal_portion = beginning
-            sched_this = interest + principal_portion
-            extra_this = 0.0  # already paid everything off
-            total_payment = sched_this
-            rows.append(ScheduleRow(
-                period=period, payment_date=pmt_date,
-                beginning_balance=_round(beginning),
-                scheduled_payment=_round(sched_this),
-                extra_payment=_round(extra_this),
-                interest=_round(interest),
-                principal=_round(principal_portion),
-                total_payment=_round(total_payment),
-                ending_balance=0.0,
-            ))
-            break
-
-        # Standard amortizing period
-        sched_principal = scheduled - interest
-        principal_portion = sched_principal + extra
-
-        if principal_portion >= beginning:
-            principal_portion = beginning
-            sched_this = min(scheduled, beginning + interest)
-            extra_this = max(0.0, principal_portion - (sched_this - interest))
-            total_payment = sched_this + extra_this
-            balance = 0.0
+    # Build index from each P&I tx to its series-start tx
+    series_start_idx: dict[int, int] = {}
+    last_label = None
+    last_start = -1
+    for i, t in enumerate(txs):
+        if t.kind == "Payment" and t.special == "P&I":
+            if t.seq_in_series == 1:
+                last_start = i
+            series_start_idx[i] = last_start
         else:
-            sched_this = scheduled
-            extra_this = extra
-            total_payment = sched_this + extra_this
-            balance = beginning - principal_portion
+            last_start = -1
+
+    for i, tx in enumerate(txs):
+        seq += 1
+        # accrue interest from last_date to tx.date
+        if tx.date > last_date:
+            yf = _day_count_fraction(last_date, tx.date, config.day_count)
+            accrued_interest += balance * annual_rate * yf
+
+        row_interest = 0.0
+        row_principal = 0.0
+        cash_flow = 0.0
+        description = ""
+
+        if tx.kind == "Loan":
+            balance += tx.amount
+            cash_flow = tx.amount
+            description = f"{tx.series_label} disbursement"
+        else:
+            # Determine payment amount
+            if tx.special == "Interest Only":
+                payment = accrued_interest
+                description = f"{tx.series_label} — Interest Only ({tx.seq_in_series}/{tx.series_size})"
+            elif tx.special == "P&I":
+                start_i = series_start_idx[i]
+                if start_i not in pi_solved:
+                    # solve using current balance + accrued, across the series
+                    series_dates = [
+                        txs[j].date for j in range(start_i, len(txs))
+                        if txs[j].kind == "Payment" and txs[j].special == "P&I"
+                        and series_start_idx.get(j) == start_i
+                    ]
+                    pv_balance = balance + accrued_interest
+                    daily = annual_rate / 365.0
+                    pi_solved[start_i] = _solve_level_payment(
+                        pv_balance, daily, series_dates, config.day_count
+                    )
+                payment = pi_solved[start_i]
+                description = f"{tx.series_label} — P&I ({tx.seq_in_series}/{tx.series_size})"
+            else:
+                payment = tx.amount
+                description = (f"{tx.series_label} — Payment "
+                               f"({tx.seq_in_series}/{tx.series_size})"
+                               if tx.series_size > 1 else
+                               f"{tx.series_label} — Payment")
+
+            # Allocate: interest first, then principal
+            interest_portion = min(payment, accrued_interest)
+            principal_portion = payment - interest_portion
+            if principal_portion > balance:
+                principal_portion = balance
+                payment = interest_portion + principal_portion
+            accrued_interest -= interest_portion
+            balance -= principal_portion
+            row_interest = interest_portion
+            row_principal = principal_portion
+            cash_flow = payment
 
         rows.append(ScheduleRow(
-            period=period, payment_date=pmt_date,
-            beginning_balance=_round(beginning),
-            scheduled_payment=_round(sched_this),
-            extra_payment=_round(extra_this),
-            interest=_round(interest),
-            principal=_round(principal_portion),
-            total_payment=_round(total_payment),
-            ending_balance=_round(balance),
+            seq=seq, date=tx.date, kind=tx.kind, description=description,
+            cash_flow=_round(cash_flow),
+            interest=_round(row_interest),
+            principal=_round(row_principal),
+            balance=_round(balance),
+            accrued_interest=_round(accrued_interest),
         ))
-        pmt_date = pmt_date + delta
+        last_date = tx.date
 
-    total_interest = sum(row.interest for row in rows)
-    total_principal = sum(row.principal for row in rows)
-    total_paid = sum(row.total_payment for row in rows)
-    total_extra = sum(row.extra_payment for row in rows)
-
-    # Baseline for comparison (standard amortization, no extras, over full term)
-    if r > 0:
-        baseline_pmt = standard_payment(inputs.principal, r, n)
-        baseline_total_interest = baseline_pmt * n - inputs.principal
-    else:
-        baseline_total_interest = 0.0
-    baseline_periods = n
-    interest_saved = max(0.0, baseline_total_interest - total_interest)
-    periods_saved = max(0, baseline_periods - len(rows))
+    total_disbursed = sum(r.cash_flow for r in rows if r.kind == "Loan")
+    total_paid = sum(r.cash_flow for r in rows if r.kind == "Payment")
+    total_interest = sum(r.interest for r in rows if r.kind == "Payment")
+    total_principal = sum(r.principal for r in rows if r.kind == "Payment")
 
     summary = {
-        "scheduled_payment": _round(scheduled),
-        "period_rate": r,
-        "periods": len(rows),
-        "baseline_periods": baseline_periods,
-        "total_interest": _round(total_interest),
-        "total_principal": _round(total_principal),
+        "total_disbursed": _round(total_disbursed),
         "total_paid": _round(total_paid),
-        "total_extra": _round(total_extra),
-        "interest_saved": _round(interest_saved),
-        "periods_saved": periods_saved,
-        "payoff_date": rows[-1].payment_date if rows else None,
+        "total_interest_paid": _round(total_interest),
+        "total_principal_paid": _round(total_principal),
+        "ending_balance": _round(rows[-1].balance) if rows else 0,
+        "ending_accrued_interest": _round(rows[-1].accrued_interest) if rows else 0,
+        "net_cost": _round(total_paid - total_disbursed),
+        "first_date": rows[0].date if rows else None,
+        "last_date": rows[-1].date if rows else None,
+        "row_count": len(rows),
     }
     return rows, summary
