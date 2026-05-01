@@ -118,10 +118,29 @@ def test_io_payments_constant_mom():
     print(f"IO constant MoM OK — all 12 IOs are ${io_rows[0].cash_flow:.2f}")
 
 
+def test_principal_only_payment():
+    """A 'Principal' special should put 100% of the payment to principal,
+    leaving accrued interest untouched."""
+    events = [
+        Event("Loan", date(2026, 1, 1), 100000.00),
+        Event("Payment", date(2026, 2, 1), 0, number=12, frequency="Monthly", special="Interest Only"),
+        Event("Payment", date(2026, 5, 15), 25000, number=1, special="Principal"),
+    ]
+    cfg = LoanConfig(nominal_annual_rate=6.0)
+    rows, summary = build_schedule(events, cfg)
+    principal_row = [r for r in rows if "Principal" in r.description][0]
+    assert principal_row.principal == 25000.00, principal_row.principal
+    assert principal_row.interest == 0.0, principal_row.interest
+    # Balance after = 100k - 25k = 75k
+    assert principal_row.balance == 75000.00, principal_row.balance
+    print(f"Principal-only OK — full ${principal_row.principal:,.2f} to principal, balance ${principal_row.balance:,.2f}")
+
+
 if __name__ == "__main__":
     test_tvalue_example()
     test_simple_amortization()
     test_multiple_loans()
     test_io_payments_constant_mom()
+    test_principal_only_payment()
     test_exports()
     print("\nAll smoke tests passed.")

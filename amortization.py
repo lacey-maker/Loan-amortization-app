@@ -14,7 +14,7 @@ from typing import Literal
 from dateutil.relativedelta import relativedelta
 
 EventType = Literal["Loan", "Payment"]
-SpecialSeries = Literal["", "Interest Only", "P&I"]
+SpecialSeries = Literal["", "Interest Only", "P&I", "Principal"]
 Frequency = Literal["Monthly", "Bi-Weekly", "Weekly", "Quarterly", "Semi-Annually", "Annually"]
 DayCount = Literal["Actual/365", "Actual/360", "30/360"]
 
@@ -274,6 +274,28 @@ def build_schedule(
             if tx.special == "Interest Only":
                 payment = accrued_interest
                 description = f"{tx.series_label} — Interest Only ({tx.seq_in_series}/{tx.series_size})"
+            elif tx.special == "Principal":
+                # Principal-only payment: full amount goes to principal,
+                # accrued interest is NOT reduced (carries to next interest payment).
+                pay_amt = min(tx.amount, balance)
+                balance -= pay_amt
+                row_principal = pay_amt
+                row_interest = 0.0
+                cash_flow = pay_amt
+                description = (f"{tx.series_label} — Principal "
+                               f"({tx.seq_in_series}/{tx.series_size})"
+                               if tx.series_size > 1 else
+                               f"{tx.series_label} — Principal Reduction")
+                rows.append(ScheduleRow(
+                    seq=seq, date=tx.date, kind=tx.kind, description=description,
+                    cash_flow=_round(cash_flow),
+                    interest=_round(row_interest),
+                    principal=_round(row_principal),
+                    balance=_round(balance),
+                    accrued_interest=_round(accrued_interest),
+                ))
+                last_date = tx.date
+                continue
             elif tx.special == "P&I":
                 start_i = series_start_idx[i]
                 if start_i not in pi_solved:

@@ -51,12 +51,14 @@ st.subheader("Events")
 st.caption(
     "Add rows for each loan disbursement and each payment series. "
     "**Type**: Loan or Payment. "
-    "**Special**: leave blank for fixed amount, choose 'Interest Only' to compute interest each period, "
-    "or 'P&I' to solve for level payment over the series."
+    "**Special**: leave blank for fixed amount (interest first, then principal); "
+    "'Interest Only' = pay accrued interest each period; "
+    "'P&I' = solve for level payment; "
+    "'Principal' = full amount goes to principal (accrued interest carries)."
 )
 
 FREQ_OPTIONS = [""] + list(PERIODS_PER_YEAR.keys())  # blank option for Loan rows
-SPECIAL_OPTIONS = ["", "Interest Only", "P&I"]
+SPECIAL_OPTIONS = ["", "Interest Only", "P&I", "Principal"]
 
 DEFAULT_EVENTS = pd.DataFrame([
     {"Type": "Loan",    "Date": date(2025, 9, 19),  "Amount": 20000.00,  "Number": 1,  "Frequency": "",        "Special": "",              "Label": ""},
