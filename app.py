@@ -55,15 +55,15 @@ st.caption(
     "or 'P&I' to solve for level payment over the series."
 )
 
-FREQ_OPTIONS = list(PERIODS_PER_YEAR.keys())
+FREQ_OPTIONS = [""] + list(PERIODS_PER_YEAR.keys())  # blank option for Loan rows
 SPECIAL_OPTIONS = ["", "Interest Only", "P&I"]
 
 DEFAULT_EVENTS = pd.DataFrame([
-    {"Type": "Loan",    "Date": date(2025, 9, 19),  "Amount": 20000.00,  "Number": 1,  "Frequency": "Monthly", "Special": "",              "Label": ""},
+    {"Type": "Loan",    "Date": date(2025, 9, 19),  "Amount": 20000.00,  "Number": 1,  "Frequency": "",        "Special": "",              "Label": ""},
     {"Type": "Payment", "Date": date(2025, 10, 19), "Amount": 0.00,      "Number": 5,  "Frequency": "Monthly", "Special": "Interest Only", "Label": ""},
-    {"Type": "Loan",    "Date": date(2026, 2, 23),  "Amount": 159000.00, "Number": 1,  "Frequency": "Monthly", "Special": "",              "Label": ""},
+    {"Type": "Loan",    "Date": date(2026, 2, 23),  "Amount": 159000.00, "Number": 1,  "Frequency": "",        "Special": "",              "Label": ""},
     {"Type": "Payment", "Date": date(2026, 3, 19),  "Amount": 0.00,      "Number": 24, "Frequency": "Monthly", "Special": "Interest Only", "Label": ""},
-    {"Type": "Payment", "Date": date(2028, 3, 19),  "Amount": 180173.14, "Number": 1,  "Frequency": "Monthly", "Special": "",              "Label": "Balloon"},
+    {"Type": "Payment", "Date": date(2028, 3, 19),  "Amount": 180173.14, "Number": 1,  "Frequency": "",        "Special": "",              "Label": "Balloon"},
 ])
 
 if "events_df" not in st.session_state:
@@ -89,7 +89,8 @@ edited_df = st.data_editor(
             help="Number of payments in the series (Payment events only).",
         ),
         "Frequency": st.column_config.SelectboxColumn(
-            "Frequency", options=FREQ_OPTIONS, required=True, width="small",
+            "Frequency", options=FREQ_OPTIONS, width="small",
+            help="Leave blank for Loan rows and single payments. Set for payment series.",
         ),
         "Special": st.column_config.SelectboxColumn(
             "Special", options=SPECIAL_OPTIONS, width="medium",
@@ -115,12 +116,13 @@ for _, row in edited_df.iterrows():
             d = d.to_pydatetime().date()
         elif hasattr(d, "date") and callable(d.date):
             d = d.date()
+        freq = row["Frequency"] or "Monthly"  # engine ignores it for Loans and single payments
         events.append(Event(
             event_type=row["Type"],
             date=d,
             amount=float(row["Amount"] or 0),
             number=int(row["Number"] or 1),
-            frequency=row["Frequency"] or "Monthly",
+            frequency=freq,
             special=row["Special"] or "",
             label=str(row["Label"] or ""),
         ))
